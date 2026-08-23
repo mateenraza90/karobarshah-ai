@@ -1,0 +1,7 @@
+import { decryptSecret } from "@/lib/security/secrets";
+import { serverEnv } from "@/lib/env.server";
+import type { WhatsAppConnection } from "@/types/database";
+export interface MessagingProvider{send(input:{to:string;text:string;connection:WhatsAppConnection}):Promise<{providerMessageId:string}>}
+export class MockMessagingProvider implements MessagingProvider{async send(_input:{to:string;text:string;connection:WhatsAppConnection}){return{providerMessageId:`mock-${crypto.randomUUID()}`};}}
+export class MetaWhatsAppProvider implements MessagingProvider{async send(input:{to:string;text:string;connection:WhatsAppConnection}){const token=decryptSecret(input.connection.access_token_ciphertext,input.connection.access_token_iv,input.connection.access_token_tag);const r=await fetch(`https://graph.facebook.com/v20.0/${input.connection.phone_number_id}/messages`,{method:"POST",headers:{authorization:`Bearer ${token}`,"content-type":"application/json"},body:JSON.stringify({messaging_product:"whatsapp",to:input.to,type:"text",text:{body:input.text}})});if(!r.ok)throw new Error(`WhatsApp provider error: ${r.status}`);const j=await r.json() as {messages?:Array<{id:string}>};return{providerMessageId:j.messages?.[0]?.id??crypto.randomUUID()};}}
+export function getMessagingProvider():MessagingProvider{return serverEnv.WHATSAPP_MODE==="meta"?new MetaWhatsAppProvider():new MockMessagingProvider();}

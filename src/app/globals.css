@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+/* Class-based dark mode (next-themes toggles `.dark` on <html>). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * KarobarShah AI design tokens.
+ *
+ * Palette is a deliberate departure from the generic "cream + terracotta"
+ * or "near-black + neon" AI-product defaults: a ledger green (trust,
+ * money, growth) paired with a brass/gold accent (the "Shah" in the
+ * name — achievement, ownership) on a warm paper neutral. Numbers and
+ * timestamps use a monospace face throughout, echoing a physical ledger.
+ */
+:root {
+  --paper: #f6f4ef;
+  --paper-raised: #ffffff;
+  --ink: #16241e;
+  --ink-muted: #55625a;
+
+  --ledger: #0e4b3d;
+  --ledger-hover: #12604f;
+  --ledger-foreground: #f6f4ef;
+
+  --brass: #c89b3c;
+  --brass-foreground: #16241e;
+
+  --clay: #b84c3e;
+  --clay-foreground: #f6f4ef;
+
+  --mist: #e4e1d6;
+  --mist-strong: #d3cfc0;
+
+  --radius: 0.625rem;
+}
+
+.dark {
+  --paper: #0e1613;
+  --paper-raised: #131d19;
+  --ink: #ede9df;
+  --ink-muted: #9aa39c;
+
+  --ledger: #1c7a63;
+  --ledger-hover: #23926f;
+  --ledger-foreground: #0e1613;
+
+  --brass: #d8ad52;
+  --brass-foreground: #16241e;
+
+  --clay: #d4695a;
+  --clay-foreground: #0e1613;
+
+  --mist: #22322c;
+  --mist-strong: #2c3f37;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-paper-raised: var(--paper-raised);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+
+  --color-ledger: var(--ledger);
+  --color-ledger-hover: var(--ledger-hover);
+  --color-ledger-foreground: var(--ledger-foreground);
+
+  --color-brass: var(--brass);
+  --color-brass-foreground: var(--brass-foreground);
+
+  --color-clay: var(--clay);
+  --color-clay-foreground: var(--clay-foreground);
+
+  --color-mist: var(--mist);
+  --color-mist-strong: var(--mist-strong);
+
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 0.25rem);
+
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+  --font-mono: var(--font-mono);
+}
+
+@layer base {
+  * {
+    border-color: var(--mist);
+  }
+
+  body {
+    background-color: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body), system-ui, sans-serif;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display), system-ui, sans-serif;
+  }
+
+  /* Visible keyboard focus everywhere — never suppressed. */
+  :focus-visible {
+    outline: 2px solid var(--brass);
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Fine hairline ledger-page pattern — used once, on the auth split panel. */
+.ledger-lines {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--ledger-foreground) 8%, transparent) 0,
+    color-mix(in srgb, var(--ledger-foreground) 8%, transparent) 1px,
+    transparent 1px,
+    transparent 2.25rem
+  );
+}

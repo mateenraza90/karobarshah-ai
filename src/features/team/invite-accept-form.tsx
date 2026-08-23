@@ -1,0 +1,3 @@
+"use client";
+import {useActionState} from "react";import {useFormStatus} from "react-dom";import {Button} from "@/components/ui/button";import type {ActionState} from "@/types";
+export function InviteAcceptForm({action,token}:{action:(p:ActionState,f:FormData)=>Promise<ActionState>;token:string}){const[state,formAction]=useActionState(action,null);const{pending}=useFormStatus();return <form action={formAction} className="mt-4"><input type="hidden" name="token" value={token}/><Button type="submit" isLoading={pending} disabled={!token}>Accept invitation</Button>{state?.error&&<p role="alert" className="mt-2 text-sm text-clay">{state.error}</p>}</form>}
