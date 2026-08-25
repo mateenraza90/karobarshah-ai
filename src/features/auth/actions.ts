@@ -3,6 +3,7 @@
 import { redirect } from "next/navigation";
 
 import { createClient } from "@/services/supabase/server";
+import { env } from "@/lib/env";
 import type { ActionState } from "@/types";
 
 import {
@@ -45,7 +46,7 @@ export async function signup(_prevState: ActionState, formData: FormData): Promi
       // Stored on the auth user now; Milestone 1 reads this when creating
       // the first `businesses` row during onboarding.
       data: { business_name: businessName },
-      emailRedirectTo: `${process.env.NEXT_PUBLIC_SITE_URL ?? ""}/auth/confirm`,
+      emailRedirectTo: `${env.NEXT_PUBLIC_SITE_URL}/auth/confirm`,
     },
   });
 
@@ -94,7 +95,7 @@ export async function requestPasswordReset(
 
   const supabase = await createClient();
   const { error } = await supabase.auth.resetPasswordForEmail(validated.data.email, {
-    redirectTo: `${process.env.NEXT_PUBLIC_SITE_URL ?? ""}/auth/confirm?next=/reset-password`,
+    redirectTo: `${env.NEXT_PUBLIC_SITE_URL}/auth/confirm?next=/reset-password`,
   });
 
   // Deliberately don't reveal whether the email exists — same success

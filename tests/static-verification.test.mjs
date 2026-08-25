@@ -101,6 +101,58 @@ test("core MVP runtime boundaries are present", () => {
   }
 });
 
+// Regression coverage for a cross-tenant IDOR found in the second-phase
+// production audit: creating/rescheduling an appointment let a caller
+// reference another organization's patient/doctor/service/clinic by ID,
+// since neither the FK constraints (which only require the row to exist
+// *somewhere*) nor RLS on `appointments` (which only checks the
+// appointment row's own organization_id) catch that. This can only be
+// verified statically here — actually exercising the race/IDOR requires a
+// live Postgres instance with two organizations' data, which this test
+// environment doesn't have. What's verified: the guard function exists,
+// checks all four references against the caller's own organization_id,
+// and is actually called (not just defined) from both write paths that
+// accept these references from a caller.
+test("appointment writes verify patient/doctor/service/clinic belong to the caller's organization", () => {
+  const db = read("src/database/appointments.ts");
+  assert.match(db, /export async function verifyAppointmentReferences/);
+  const dbCallSite = db.slice(db.indexOf("verifyAppointmentReferences", db.indexOf("export async function verifyAppointmentReferences") + 1));
+  assert.match(dbCallSite, /eq\("organization_id",\s*organizationId\)/);
+
+  const actions = read("src/features/appointments/actions.ts");
+  assert.match(actions, /import\s*{[^}]*verifyAppointmentReferences[^}]*}\s*from\s*"@\/database\/appointments"/);
+  const createFn = actions.slice(actions.indexOf("export async function createAppointmentAction"), actions.indexOf("export async function rescheduleAppointmentAction"));
+  const rescheduleFn = actions.slice(actions.indexOf("export async function rescheduleAppointmentAction"));
+  for (const fn of [createFn, rescheduleFn]) {
+    assert.match(fn, /verifyAppointmentReferences\(/);
+    // The verification result must actually gate the write, not just be
+    // computed and discarded.
+    assert.match(fn, /if\s*\(!validRefs\)\s*return\s*{\s*error:/);
+  }
+});
+
+// Regression coverage for patient-record deduplication: the WhatsApp
+// webhook's find-or-create-patient logic looks a patient up by phone with
+// `.maybeSingle()` (which assumes at most one match) and falls back to a
+// re-select on insert conflict — both only work correctly if
+// (organization_id, phone) is actually unique at the database level.
+// (An initial pass of this audit mistakenly concluded that constraint was
+// missing, based on only checking the lines immediately after `create
+// table patients`; a unique index enforcing exactly this was already
+// present, just added later in the same migration file rather than next
+// to the table definition. Corrected here — no new migration was needed.)
+// Actually exercising the concurrent-webhook race requires a live
+// database and two simultaneous requests, which isn't possible in this
+// static test environment; what's verified is that the constraint and
+// the webhook's lookup both target the same column pair.
+test("patient phone uniqueness is enforced and matches the webhook's lookup semantics", () => {
+  const migration = read("supabase/migrations/20260812000000_core_mvp.sql");
+  assert.match(migration, /create unique index patients_org_phone_unique_idx on patients \(organization_id, phone\) where phone is not null/);
+
+  const webhook = read("src/app/api/webhooks/whatsapp/route.ts");
+  assert.match(webhook, /\.from\("patients"\)[\s\S]{0,200}\.eq\("phone",\s*msg\.from\)[\s\S]{0,80}\.maybeSingle\(\)/);
+});
+
 test("AI tools are fixed and organization context is executor-owned", () => {
   const tools = read("src/ai/tools/index.ts");
   const executor = read("src/ai/tools/executor.ts");

@@ -29,3 +29,27 @@ export async function checkAvailability(client: Client, organizationId: string, 
   const { data, error } = await q.limit(1);
   return { available: !error && (data?.length ?? 0) === 0, error };
 }
+
+/**
+ * An appointment's patient/doctor/service/clinic foreign keys only require
+ * that the referenced row exist *somewhere* — they don't require it to
+ * belong to the same organization as the appointment. Without this check,
+ * a caller could reference another organization's patient/doctor/service/
+ * clinic by ID (a cross-tenant IDOR) and neither the FK constraints nor
+ * RLS on `appointments` itself would catch it, since that policy only
+ * checks the appointment row's own organization_id. Every write path that
+ * lets a caller set these four references must call this first.
+ */
+export async function verifyAppointmentReferences(
+  client: Client,
+  organizationId: string,
+  refs: { patientId: string; doctorId: string; serviceId: string; clinicId: string },
+): Promise<boolean> {
+  const [clinic, patient, doctor, service] = await Promise.all([
+    client.from("clinics").select("id").eq("id", refs.clinicId).eq("organization_id", organizationId).maybeSingle(),
+    client.from("patients").select("id").eq("id", refs.patientId).eq("organization_id", organizationId).eq("is_active", true).maybeSingle(),
+    client.from("doctors").select("id").eq("id", refs.doctorId).eq("organization_id", organizationId).eq("is_active", true).maybeSingle(),
+    client.from("services").select("id").eq("id", refs.serviceId).eq("organization_id", organizationId).eq("is_active", true).maybeSingle(),
+  ]);
+  return Boolean(clinic.data && patient.data && doctor.data && service.data);
+}

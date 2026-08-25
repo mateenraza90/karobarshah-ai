@@ -1,111 +1,91 @@
-# KarobarShah AI — Final Production-Readiness Report
+# KarobarShah AI — Production Readiness Final Report
 
-## 1. Files changed (this pass)
+## 1. Executive Summary
 
-- `tests/static-verification.test.mjs` — rewritten path resolution (Windows test-path bug)
-- `src/lib/env.ts` — lazy environment validation (build-time crash fix)
-- `src/lib/env.server.ts` — lazy environment validation (build-time crash fix)
-- `package.json` — added `verify` script
+This pass performed a full functional and security audit of the current codebase — tracing every major flow (signup, login, patients, appointments, conversations, AI, WhatsApp, invitations) and reviewing every route — rather than re-verifying that previously-passing checks still pass. Six concrete issues were found and fixed: one real cross-tenant IDOR, one silent env-validation bypass, one UI/authorization inconsistency, two UI completeness gaps (raw UUIDs shown instead of names), and one unnecessary sensitive-field selection. A seventh suspected issue (patient phone uniqueness) was investigated, initially misdiagnosed as missing, and — on deeper verification against the actual original project files — found to already be correctly enforced; that incorrect "fix" was reverted. This is disclosed in full in §3 rather than omitted, per the standing instruction to be completely honest.
 
-No other files were touched in this pass. (Files changed in earlier passes — `src/types/database.ts`, `eslint.config.mjs`, and four lint-cleanup files — are unchanged from before; see the git-diff summary in §5 for the complete, cumulative file list against the original upload.)
+**Status: PASS WITH LIMITATIONS.** Typecheck, lint, and all 12 tests pass. The production build passes with all dependencies but cannot complete a single command's worth of proof of "real fonts + zero env vars" in this review sandbox specifically because outbound network access here doesn't reach `fonts.googleapis.com` — isolated and proven separately in §8, not assumed.
 
-## 2. What was fixed
+## 2. Audit Scope
 
-### A. Windows test-path bug (3 failing tests → 0)
+Full read-through of: `package.json`, `README.md`, `docs/*`, all of `src/` (auth, tenant/RLS helpers, AI orchestrator/tools/providers/context/prompts, WhatsApp webhook/security/provider, all 25 routes and their server actions, database access layer, env validation), all 6 migrations, `.env.example`, `.gitignore`, `next.config.ts`, `src/proxy.ts` + `src/services/supabase/middleware.ts`. Flows traced end-to-end: signup→org creation→membership→onboarding→dashboard; login→session→dashboard; patient and appointment CRUD with tenant isolation; conversations→AI processing; AI provider selection→context→tools→executor; WhatsApp webhook signature→dedup→org resolution→persistence→AI; team invitations→acceptance→membership.
 
-Three test blocks built the repo root with `new URL("..", import.meta.url).pathname` and passed that string into `path.join()`. This is broken on Windows in two independent ways: `URL#pathname` never decodes percent-encoding (a space in a username becomes a literal `%20`), and it leaves a leading `/` before the drive letter (`/C:/Users/...`). When that malformed leading-slash string reaches `path.join()`/`readFileSync()` on Windows, it gets parsed as "root of the current drive" and Windows re-prepends the actual current drive letter — producing exactly the reported `C:\C:\Users\Taqi%20Raza\...` doubling.
+## 3. Issues Found
 
-**Fix:** the whole file now resolves the project root once, at the top, via `dirname(fileURLToPath(import.meta.url))` — `fileURLToPath` is the correct, cross-platform way to turn a `file://` URL into a real OS-native path, and it fully decodes percent-encoding and handles Windows drive letters correctly. Every test now goes through a single shared `resolvePath()`/`read()`/`fileExists()` helper built on that, so this class of bug can't reappear in one test block while being fixed in another. All existing assertions and security checks are unchanged — only path construction changed.
+### Fixed
 
-Verified two ways: `npm test` (10/10 pass on this Linux sandbox — always passed there, since this bug is Windows-specific), and a standalone reproduction using `node:path`'s `win32` variants to simulate real Windows path semantics, confirming the old code produces the exact doubled/`%20`-encoded path from your report and the new code does not.
+1. **Cross-tenant IDOR in appointment booking (security).** `createAppointmentAction`/`rescheduleAppointmentAction` accepted a patient/doctor/service/clinic ID without verifying it belongs to the caller's own organization. Neither the FK constraints (which only require the row to exist *somewhere*) nor RLS on `appointments` (which only checks the appointment row's own `organization_id`) catch this. The AI tool executor already had this exact protection (`requireBookableResources`); the human-facing actions didn't. — `src/database/appointments.ts`, `src/features/appointments/actions.ts`
 
-### B. Build-time environment-variable crash (`/auth/confirm` and others)
+2. **Silent environment-validation bypass.** `src/features/auth/actions.ts` read `process.env.NEXT_PUBLIC_SITE_URL` directly with a `?? ""` fallback in two places (signup confirmation link, password-reset link), bypassing the validated `env` module used everywhere else in the codebase — meaning a misconfigured/missing site URL would silently produce a broken relative confirmation link instead of failing loudly. — `src/features/auth/actions.ts`
 
-`src/lib/env.ts` and `src/lib/env.server.ts` both validated `process.env` **eagerly at module load** (`export const env = loadEnv();`). Route handlers like `/auth/confirm/route.ts` import `@/services/supabase/server`, which imports `@/lib/env` at its top level — so merely *importing* that module chain (which Next's `next build` "collect page data" step does for every route, to read exported config, regardless of whether the route handler is ever actually invoked) was enough to throw if the variables weren't set, well before any real request existed.
+3. **`/calls` nav item mislabeled "active".** It is a bare `redirect("/conversations")` with no voice-specific filtering anywhere in the app (the schema's `voice` channel value is otherwise unused). Relabeled `"planned"`, consistent with how `/reviews` (also unbuilt) is already handled. — `src/lib/constants.ts`
 
-This was confirmed by tracing the exact import chain (`route.ts` → `services/supabase/server.ts` → `lib/env.ts`) and confirming every actual *read* of `env.X`/`serverEnv.X` elsewhere in the codebase already happens inside function bodies, never at another module's top level — meaning fixing just these two files fully resolves it everywhere, with no other file needing changes.
+4. **AI settings page didn't hide the activate/deactivate control for unauthorized roles.** The server action (`setReceptionistStatus`) already enforced the role check correctly — this was a UI consistency gap, not a security hole — but every other settings page hides restricted controls, this one didn't. — `src/app/(dashboard)/settings/ai/page.tsx`
 
-**Fix:** both files now validate lazily, on first property access, via a cached loader function and per-property getters (`export const env = { get NEXT_PUBLIC_SUPABASE_URL() { return loadEnv().NEXT_PUBLIC_SUPABASE_URL; }, ... }`). Importing the module no longer runs validation; only actually reading a property does — which happens inside `createClient()`/`createAdminClient()`/`updateSession()` function bodies, i.e. at real request time, not build-analysis time. **The validation logic itself, its error message, and its behavior when a variable really is missing are all completely unchanged** — this defers *when* the check runs, not *whether* it runs or what it accepts. Verified directly: with zero `.env` files present at all, the property access still throws the exact original error message the moment it's actually read.
+5. **Raw UUIDs shown instead of names.** Both the dashboard's "Today's appointments" card and the Appointments page's "Upcoming" table displayed `a.patient_id`/`a.doctor_id`/`a.service_id` directly instead of resolving them to names — despite the Appointments page already fetching patient/doctor/service lists for its booking form. Added name lookups (including for archived/inactive resources referenced by existing appointments, not just the active ones used in the booking dropdowns) to both pages. — `src/app/(dashboard)/dashboard/page.tsx`, `src/app/(dashboard)/appointments/page.tsx`
 
-This is the proper architectural fix, not a workaround: build-time and runtime concerns are now correctly separated. It was verified by running the real, unmodified `npm run build` with **no `.env.local` and no environment variables set anywhere** (only the empty-placeholder `.env.example` present) — the build no longer fails on environment validation at all; it proceeds all the way through `/auth/confirm` and every other route, and (in this sandbox specifically) only stops later at the pre-existing, unrelated Google Fonts network restriction described in §5.
+6. **Unnecessary sensitive-field selection.** `invite/accept/page.tsx` selected `token_hash` into a Server Component even though it's never referenced in the rendered output — the actual accept flow independently re-hashes the token from the URL. Not exploitable as written (React Server Components only serialize the returned tree, not the whole closure), but fragile and unnecessary. Removed from the select. — `src/app/invite/accept/page.tsx`
 
-Because this fix only changes *when* validation runs, production behavior on Vercel (where the real Supabase env vars are always set as project environment variables before the build even starts) is unaffected — Vercel builds will succeed exactly as before, and any real request that reaches Supabase-dependent code will still validate and fail loudly if a variable is ever actually missing at runtime.
+### Investigated, found to be a misdiagnosis, corrected
 
-## 3. Why the Windows test-path bug happened
+7. **Patient phone uniqueness.** An earlier pass in this audit concluded `(organization_id, phone)` had no unique constraint on `patients` — based on only checking the lines immediately following `create table patients`, which show a plain, non-unique index. A new migration was written and a test added for it. On deeper verification (required for this report's honesty standard), the actual project already contains `create unique index patients_org_phone_unique_idx on patients (organization_id, phone) where phone is not null;`, added later in the same migration file rather than beside the table definition — which is why the earlier, narrower check missed it. **This was confirmed against a completely fresh, independent extraction of the original project files, not assumed.** The redundant new migration (which would have failed to apply — "relation already exists" — against a real database, since the index name already exists) was deleted, and the regression test was corrected to verify the pre-existing constraint instead of the deleted file. No actual bug existed here; the webhook's find-or-create-patient logic was already correctly backed by a real database constraint the whole time.
 
-Covered in §2A. In one sentence: `URL#pathname` is not a file-system path — it's a URL component that keeps percent-encoding and, on Windows, an extra leading slash before the drive letter — and feeding it directly into `path.join()` only "happens to work" on POSIX systems where there's no drive letter to double.
+### Noted, not fixed (minor, judged not worth the risk/scope for this pass)
 
-## 4. How the environment/build issue was fixed
+- Hard-delete actions (`deleteDoctorAction` and similar) surface a raw Postgres foreign-key-violation message if the row is still referenced elsewhere (e.g., an appointment), instead of a friendlier message. Not a crash, not a security issue — just unpolished error text.
+- `sendConversationMessage` (the manual staff-composed message feature on a conversation) stores both the staff message and the AI's reply as `direction: "outbound"`. Functionally correct and tenant-scoped, but the intent (staff reply vs. AI-response-preview tool) isn't fully clear from the code alone, and reinterpreting it risked changing behavior no one asked to change. Flagged for product-level clarification, not touched.
+- `/crm` is a thin, honest signpost to the real Patients feature rather than a separate feature — this is a legitimate design choice (transparently labeled), not a stub misrepresented as complete.
 
-Covered in §2B: eager, module-load-time validation was converted to lazy, first-access validation in both `src/lib/env.ts` and `src/lib/env.server.ts`, with results cached after the first successful validation. No call site (`env.NEXT_PUBLIC_SUPABASE_URL`, `serverEnv.SUPABASE_SERVICE_ROLE_KEY`, etc., used throughout the Supabase client/admin/middleware files) needed to change, since property-access syntax is identical before and after.
+## 4. Security Fixes
 
-## 5. Exact commands executed
+Item 1 above (cross-tenant IDOR) is the only finding in this pass that was a genuine security gap rather than a UX/consistency issue. Everything else reviewed and confirmed correct, unchanged: service-role client is `server-only`-guarded and never imported by client code; tenant context is always derived from the authenticated membership (`getCurrentMembership()`/`requireMembership()`), never from client input; the AI orchestrator takes `organizationId` as a hard function parameter that the AI cannot influence, with prompt-injection guardrails in the system prompt *and* a real code-level enforcement boundary (not relying on the model obeying instructions); the WhatsApp webhook verifies HMAC (timing-safe) before parsing anything, resolves organization identity server-side from `phone_number_id` (never from webhook payload content), and its message deduplication is genuinely backed by a DB unique constraint with correct conflict handling; invitation tokens are cryptographically random with only their SHA-256 hash stored, and acceptance is row-locked, email-matched, one-time-use, with the role taken from the stored invite (never client input); the login/signup/password-reset/auth-confirm redirect targets are all validated with the same `startsWith("/") && !startsWith("//")` pattern; `src/proxy.ts`/`middleware.ts` uses `getUser()` (re-validates against Supabase Auth), never the unsafe `getSession()`, for its redirect decisions, and covers every protected route.
 
-```
-npm ci
-npx tsc --noEmit -p tsconfig.json      # typecheck
-npm run lint
-npm test -- --run
-node scripts/static-verification.mjs
-npm run build                          # real, no env vars set at all
-npm run verify                         # typecheck && lint && test && build
-```
-Plus, for the Windows-bug fix specifically, a standalone repro script exercising `node:path`'s `win32` module to simulate real Windows path semantics without needing an actual Windows machine.
+## 5. Data Integrity Fixes
 
-Plus, for the font/build isolation described in §7, a temporary swap of `src/lib/fonts.ts` for a static stub, build, then restore — checksum-verified (`md5sum`) byte-identical to the original before and after, so the shipped project's font configuration was never actually changed.
+None required in this pass beyond what's listed above — the one data-integrity concern investigated (patient phone uniqueness) turned out to already be correctly enforced (see §3, item 7).
 
-Also: a temporary local git repository was initialized from the original pristine uploaded project as a baseline, this final state was applied on top, and `git diff --cached --check` / `--stat` were run to confirm no accidental files (node_modules, .next, .env, logs, temp files) crept into the change set. See §9.
+## 6. UX / Product Fixes
 
-## 6. Exact results
+Items 3, 4, and 5 above.
+
+## 7. Tests Added or Updated
+
+- `tests/static-verification.test.mjs` gained a regression test asserting the appointment-write cross-tenant guard (`verifyAppointmentReferences`) exists, checks all four references against the caller's `organization_id`, and is actually called — not just defined — from both `createAppointmentAction` and `rescheduleAppointmentAction`.
+- A second new test asserts the patient-phone unique constraint exists and targets the same column pair the WhatsApp webhook's `.maybeSingle()` lookup uses.
+- Both are static/source-pattern assertions, consistent with this suite's existing approach (there is no live Postgres/Supabase instance available in this environment to exercise real concurrency or cross-tenant runtime behavior) — documented here rather than faked, per instruction.
+- Test count: 12/12 passing (was 10/10 before this pass).
+
+## 8. Verification Results
+
+Ran from a clean `rm -rf node_modules && npm ci`:
 
 | Command | Result |
 |---|---|
-| `npm ci` | **PASS** |
+| `npm ci` | PASS — 428 packages |
 | `npm run typecheck` | **PASS — 0 errors** |
 | `npm run lint` | **PASS — 0 errors, 0 warnings** |
-| `npm test` | **PASS — 10/10** (was 7/10 — the 3 Windows-path failures are fixed) |
-| `node scripts/static-verification.mjs` | **PASS** — 132 files inspected |
-| `npm run build` (real, this sandbox, zero env vars set) | Gets past environment validation entirely now; **fails only later, on the Google Fonts network fetch** — see §7 |
-| `npm run build` (isolated diagnostic: fonts stubbed, zero env vars) | **PASS — all 28 routes generated**, including `/auth/confirm` |
-| `npm run verify` | Passes `typecheck && lint && test`; **stops at `build` for the same sandbox-only font reason** |
+| `npm test` | **PASS — 12/12** |
+| `node scripts/static-verification.mjs` | **PASS** — 132 files |
+| `npm run build` (real, this sandbox, zero env vars) | Passes typecheck/lint/test/env-validation entirely; **fails only on `fonts.googleapis.com`**, which this sandbox's network allowlist doesn't include (package registries only) |
+| `npm run build` (isolated diagnostic: `src/lib/fonts.ts` temporarily stubbed, checksummed before/after to confirm an exact, unmodified restore) | **PASS — all 28 routes generated**, including every route this pass touched |
+| `npm run verify` | Passes `typecheck && lint && test`; **stops at `build` for the identical sandbox-only reason** |
 
-**On the acceptance criteria as literally stated** (`npm run build => PASS`, `npm run verify => PASS`, unqualified): neither fully completes inside *this specific review sandbox*, because this sandbox's outbound network access is allowlisted to package registries only and does not include `fonts.googleapis.com`. Every other criterion — typecheck, lint, 10/10 tests, static verification, and the entire build pipeline up to and past environment validation — passes cleanly. This is stated plainly rather than claiming a false PASS; see §7 for the proof that this is the only remaining blocker and that it is sandbox-specific, not a project defect.
+The real, unmodified `next/font/google` configuration ships in the delivered project — the stub used for isolation was discarded immediately after the diagnostic build and never committed or packaged. This will build normally on Vercel, which has standard internet access.
 
-## 7. Remaining warnings / sandbox limitation
+## 9. Known Limitations / Remaining Risks
 
-No ESLint warnings, no TypeScript errors, no failing tests, no npm audit-blocking issues (the `npm audit` output shows only the same pre-existing dependency advisories from `npm ci`, unrelated to this project's own code).
+- **No live database in this environment.** Everything above the database-migration layer (RLS behavior under real concurrent load, the appointment IDOR fix's actual query results against real cross-org data, the patient-phone unique constraint's real conflict behavior) is verified by careful code/schema review and static tests, not live execution. Recommend running the actual migrations against a staging Supabase project and smoke-testing the appointment-booking and WhatsApp flows before relying on this in production.
+- **`/calls` and `/reviews` are not implemented features** — both are honestly labeled `"planned"` in the nav and present an appropriate "coming soon" state; `/crm` is a working signpost to the real Patients feature, not a separate CRM implementation.
+- **Minor unpolished error text** on some hard-delete actions when a foreign-key restriction blocks the delete (see §3) — cosmetic, not fixed in this pass.
+- **This review sandbox cannot reach Google Fonts** — see §8. Not a project defect; will not occur on Vercel.
 
-The **only** unresolved item is the build sandbox's inability to reach `fonts.googleapis.com` (used by `next/font/google` in `src/app/layout.tsx`/`src/lib/fonts.ts` to self-host Inter, JetBrains Mono, and Space Grotesk). This was isolated, not assumed: `src/lib/fonts.ts` was temporarily replaced with a static-CSS-variable stub (checksummed before/after to prove an exact, unmodified restore), and with that swap in place the build completed successfully end-to-end — all 28 routes, zero environment variables required. The real, unmodified `next/font/google` configuration ships in this ZIP; it was never permanently changed. This will build normally on Vercel, which has standard internet access.
+## 10. Dependency / npm audit Status
 
-## 8. Vercel environment variables to configure
+`npm audit` reported 6 high-severity advisories before this pass. Investigated individually rather than blindly force-fixing:
 
-Set these in the Vercel project's Environment Variables before deploying (values from your real Supabase project — `.env.example` documents the same set with placeholders only):
+- **3 resolved safely** via plain `npm audit fix` (no `--force`, no dependency-range changes — `package.json` is byte-identical before/after, only `package-lock.json`'s resolved versions changed): `brace-expansion` (DoS via unbounded expansion), `js-yaml` (quadratic CPU consumption), `nanoid` (infinite loop on zero size). All three are dev-tooling/build-time dependencies, not runtime application code paths.
+- **2 remain, deliberately not force-fixed**: `postcss` (XSS/path-traversal in CSS stringify/source-map handling) and `sharp` (inherited `libvips` CVEs), both bundled transitively by `next` itself. The only available fix requires `npm audit fix --force`, which would bump `next` to `16.3.2` — **outside the version range this project currently depends on**. Per explicit instruction not to force breaking dependency changes blindly: this was not applied. Practical exposure is low in this app's context — `postcss`'s vulnerabilities require processing untrusted/attacker-controlled CSS or source-map input at build time, and this project only builds its own developer-authored Tailwind/CSS, never third-party or user-supplied CSS; `sharp` is used by Next's built-in image-optimization route, which is a smaller, distinct risk surface but not zero. **Recommendation:** upgrade Next.js deliberately (test the new version against this app specifically) rather than accepting an unreviewed forced bump as a side effect of an audit fix.
 
-**Public (safe to expose to the browser):**
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `NEXT_PUBLIC_SITE_URL`
+## 11. Git / Release Status
 
-**Server-only secrets (never prefixed `NEXT_PUBLIC_`, never sent to the browser):**
-- `SUPABASE_SERVICE_ROLE_KEY` — required
-- `AI_PROVIDER` — optional, defaults to `mock`
-- `OPENAI_API_KEY` / `OPENAI_BASE_URL` — only if `AI_PROVIDER=openai`
-- `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` — only if `AI_PROVIDER=anthropic`
-- `WHATSAPP_MODE` — optional, defaults to `mock`
-- `WHATSAPP_APP_SECRET` / `WHATSAPP_VERIFY_TOKEN` / `WHATSAPP_ENCRYPTION_KEY` — only if `WHATSAPP_MODE=meta`
-
-Every `process.env.*` reference anywhere in `src/` was cross-checked one-for-one against `.env.example` — the two lists match exactly, nothing used is undocumented and nothing documented is unused.
-
-**On `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`:** this project consistently uses the classic `NEXT_PUBLIC_SUPABASE_ANON_KEY` naming throughout the env schema, `.env.example`, and all three Supabase client constructors — not Supabase's newer publishable/secret key naming. Both are valid and fully supported by `@supabase/supabase-js`; this was left as-is rather than renamed, since it's a working, consistent convention, not a defect, and renaming it project-wide would be an unrequested architectural change.
-
-## 9. Confirmation no secrets were added
-
-- No `.env` or `.env.local` file is present in the shipped project (a local-only `.env.local` with obviously-fake placeholder values, used solely for interactive build testing, was deleted before packaging).
-- `.gitignore` already correctly ignores `node_modules`, `.next`, and `.env*` (except `.env.example`), which covers `.env`, `.env.local`, and `.env.*.local` as requested.
-- `.env.example` contains only empty placeholders.
-- A full-repository scan for API-key/JWT-shaped strings found nothing.
-- A complete diff against the original pristine upload (via a temporary local git baseline) confirms every changed file is accounted for above and in the prior round's report — no `node_modules`, `.next`, `.env`, logs, or temp files appear in the change set, and `git diff --check` reports no whitespace/conflict-marker issues.
-
-## 10. Final ZIP
-
-**`karobarshah-ai-final-production-ready.zip`**, delivered alongside this report. Extracts with the project at its root (`package.json`, `src/`, `supabase/`, etc. directly at the top level — no nested duplicate folder), ready for `npm ci && npm run typecheck && npm run lint && npm test && npm run build` after extraction on a machine with normal internet access.
+No `.git` directory exists in this review environment — the project was provided as a source export, and this sandbox has no GitHub credentials for `mateenraza90/karobarshah-ai`. A local git repository was initialized here (`git init`, remote set to the stated `origin`), all current changes staged and committed with message `fix: complete production readiness audit`, and `git status` confirmed clean afterward — see the exact commit hash and push instructions in the final response below. **This sandbox cannot push on your behalf; run the provided command from a machine with your GitHub credentials to actually update the remote.**
