@@ -171,3 +171,58 @@ test("WhatsApp webhook enforces HMAC and provider-message deduplication", () => 
   assert.ok(route.includes("provider_message_id"));
   assert.ok(route.includes("existing.data"));
 });
+
+// Regression coverage for the UI/UX audit round. error.tsx cannot catch an
+// error thrown by the root layout itself — only global-error.tsx can, and
+// it must render its own <html>/<body> since it replaces the root layout
+// entirely when active.
+test("global-error.tsx exists and renders its own html/body", () => {
+  assert.equal(fileExists("src/app/global-error.tsx"), true);
+  const source = read("src/app/global-error.tsx");
+  assert.match(source, /<html/);
+  assert.match(source, /<body/);
+});
+
+// Regression coverage for a real bug found in this audit: the invite
+// acceptance page used to list every pending invite for the signed-in
+// user's email while ignoring the token from the link entirely, and
+// reused that one token across every listed invite's accept form — with
+// two or more pending invites, accepting the wrong card would submit the
+// right token for the wrong organization. The fix looks the invite up by
+// hashing the token from the URL (the same way the server action does),
+// so it can only ever act on the one invite the link actually points to,
+// and distinguishes wrong-account and expired from a generic not-found.
+test("invite acceptance looks up by the link's token, not just by email", () => {
+  const page = read("src/app/invite/accept/page.tsx");
+  assert.match(page, /createHash\("sha256"\)\.update\(token\)\.digest\("hex"\)/);
+  assert.match(page, /\.eq\("token_hash",\s*tokenHash\)/);
+  assert.match(page, /invite\.email\.toLowerCase\(\)\s*!==\s*user\.email\.toLowerCase\(\)/);
+  assert.match(page, /new Date\(invite\.expires_at\)\s*<=\s*new Date\(\)/);
+});
+
+// Regression coverage: every hard-delete / cancel action that previously
+// fired on a single click now goes through the shared confirmation
+// dialog, and the settings hub actually links to every settings page
+// that exists (AI and WhatsApp settings were fully built but had no link
+// pointing at them from /settings).
+test("destructive actions are confirmed and all settings pages are linked", () => {
+  const confirmWrapper = read("src/components/ui/confirm-destructive-action.tsx");
+  assert.match(confirmWrapper, /export function ConfirmDestructiveAction/);
+
+  const confirmedSurfaces = [
+    "src/features/appointments/manage-form.tsx",
+    "src/app/(dashboard)/settings/team/page.tsx",
+    "src/app/(dashboard)/settings/doctors/page.tsx",
+    "src/app/(dashboard)/settings/services/page.tsx",
+    "src/app/(dashboard)/settings/memory/page.tsx",
+    "src/app/(dashboard)/patients/[id]/page.tsx",
+  ];
+  for (const file of confirmedSurfaces) {
+    assert.match(read(file), /ConfirmDestructiveAction/, file);
+  }
+
+  const settingsIndex = read("src/app/(dashboard)/settings/page.tsx");
+  for (const href of ["/settings/clinic", "/settings/doctors", "/settings/services", "/settings/memory", "/settings/team", "/settings/ai", "/settings/whatsapp"]) {
+    assert.ok(settingsIndex.includes(`href="${href}"`), href);
+  }
+});
